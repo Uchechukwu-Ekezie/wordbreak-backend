@@ -28,6 +28,9 @@ const poolABIJSON = `[
   {"type":"function","name":"roundExists","stateMutability":"view",
    "inputs":[{"name":"","type":"uint256"}],
    "outputs":[{"name":"","type":"bool"}]},
+  {"type":"function","name":"scoreCount","stateMutability":"view",
+   "inputs":[{"name":"","type":"uint256"},{"name":"","type":"address"}],
+   "outputs":[{"name":"","type":"uint256"}]},
   {"type":"function","name":"getRound","stateMutability":"view",
    "inputs":[{"name":"","type":"uint256"}],
    "outputs":[
@@ -88,6 +91,20 @@ func (c *Client) HasEntered(ctx context.Context, roundID *big.Int, addr common.A
 		return false, fmt.Errorf("hasEntered: unexpected return type")
 	}
 	return entered, nil
+}
+
+// ScoreCount returns how many scores addr has already recorded for roundID -- also the
+// `attempt` nonce their next recordScore call must use.
+func (c *Client) ScoreCount(ctx context.Context, roundID *big.Int, addr common.Address) (*big.Int, error) {
+	var out []interface{}
+	if err := c.bound.Call(&bind.CallOpts{Context: ctx}, &out, "scoreCount", roundID, addr); err != nil {
+		return nil, fmt.Errorf("scoreCount: %w", err)
+	}
+	count, ok := out[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("scoreCount: unexpected return type")
+	}
+	return count, nil
 }
 
 // RoundExists reports whether a round has been opened on-chain.

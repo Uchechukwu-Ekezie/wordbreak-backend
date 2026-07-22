@@ -1,10 +1,18 @@
 // Writer gives the backend the ability to broadcast transactions against WordBreakPools —
-// specifically createRound (to open a staked multiplayer room on-chain) and settle (to pay
-// the winner once a staked race ends). This is separate from the referee signer: the signer
-// only produces off-chain EIP-712 signatures and never needs gas; the Writer holds a funded
+// createRound (to open a staked multiplayer room or a daily pool on-chain), settle (to pay
+// out once a round ends), and recordScore (to log one played game's score immediately,
+// independent of settlement). This is separate from the referee signer: the signer only
+// produces off-chain EIP-712 signatures and never needs gas; the Writer holds a funded
 // operator key that actually sends transactions. createRound requires the caller to be the
-// pool's owner or referee (enforced by the contract); settle has no such restriction because
-// the EIP-712 signature itself is the authorization, so the Writer can be any funded account.
+// pool's owner or referee (enforced by the contract); settle and recordScore have no such
+// restriction because the EIP-712 signature itself is the authorization, so the Writer can be
+// any funded account.
+//
+// All Transact calls go through a single mutex: go-ethereum's bind package assigns each
+// transaction's nonce by querying the pending nonce at send time, so two goroutines racing to
+// broadcast from the same operator key can fetch the same nonce and collide. recordScore can
+// fire far more often than createRound/settle ever did (once per play, not once per round), so
+// this is the call path where that race actually becomes likely rather than theoretical.
 package chain
 
 import (
@@ -12,6 +20,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -27,11 +36,17 @@ const writeABIJSON = `[
   {"type":"function","name":"settle","stateMutability":"nonpayable",
    "inputs":[{"name":"roundId","type":"uint256"},{"name":"winners","type":"address[]"},
              {"name":"amounts","type":"uint256[]"},{"name":"signature","type":"bytes"}],
+   "outputs":[]},
+  {"type":"function","name":"recordScore","stateMutability":"nonpayable",
+   "inputs":[{"name":"roundId","type":"uint256"},{"name":"player","type":"address"},
+             {"name":"score","type":"uint256"},{"name":"attempt","type":"uint256"},
+             {"name":"signature","type":"bytes"}],
    "outputs":[]}
 ]`
 
 // Writer broadcasts write transactions against a deployed WordBreakPools.
 type Writer struct {
+	mu      sync.Mutex // serializes every Transact call -- see the package doc comment
 	bound   *bind.BoundContract
 	eth     *ethclient.Client
 	auth    *bind.TransactOpts
@@ -74,6 +89,8 @@ func (w *Writer) Address() common.Address { return w.address }
 
 // CreateRound opens a round on-chain and blocks until the transaction is mined.
 func (w *Writer) CreateRound(ctx context.Context, roundID *big.Int, entryFee *big.Int, endTime uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	opts := *w.auth
 	opts.Context = ctx
 	tx, err := w.bound.Transact(&opts, "createRound", roundID, entryFee, endTime)
@@ -89,6 +106,8 @@ func (w *Writer) CreateRound(ctx context.Context, roundID *big.Int, entryFee *bi
 
 // Settle submits a referee-signed result and blocks until the transaction is mined.
 func (w *Writer) Settle(ctx context.Context, roundID *big.Int, winners []common.Address, amounts []*big.Int, sig []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	opts := *w.auth
 	opts.Context = ctx
 	tx, err := w.bound.Transact(&opts, "settle", roundID, winners, amounts, sig)
@@ -98,6 +117,26 @@ func (w *Writer) Settle(ctx context.Context, roundID *big.Int, winners []common.
 	_, err = bind.WaitMined(ctx, w.eth, tx)
 	if err != nil {
 		return fmt.Errorf("settle: waiting for confirmation: %w", err)
+	}
+	return nil
+}
+
+// RecordScore submits a referee-signed score for one play and blocks until the transaction is
+// mined. attempt must match the contract's current on-chain scoreCount(roundId, player) --
+// callers should read that (via chain.Client.ScoreCount) immediately before signing, under the
+// same care needed for any nonce: stale attempt values fail with WordBreakPools.InvalidAttempt.
+func (w *Writer) RecordScore(ctx context.Context, roundID *big.Int, player common.Address, score, attempt *big.Int, sig []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	opts := *w.auth
+	opts.Context = ctx
+	tx, err := w.bound.Transact(&opts, "recordScore", roundID, player, score, attempt, sig)
+	if err != nil {
+		return fmt.Errorf("recordScore: %w", err)
+	}
+	_, err = bind.WaitMined(ctx, w.eth, tx)
+	if err != nil {
+		return fmt.Errorf("recordScore: waiting for confirmation: %w", err)
 	}
 	return nil
 }

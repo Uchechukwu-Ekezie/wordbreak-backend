@@ -8,7 +8,11 @@
 //	GET  /api/solo/grid?size=4             -> a fresh solo grid board (Boggle-style, answers included)
 //	POST /api/solo/score                   -> score {letters, words[]}
 //	GET  /api/daily                        -> today's shared rack
-//	POST /api/daily/submit                 -> submit {address, words[]} for today
+//	POST /api/daily/submit                 -> submit {address, words[]} for today (for a paid
+//	                                           round, also logs this play's score on-chain via
+//	                                           WordBreakPools.recordScore -- one permanent entry
+//	                                           per play, not just the best; fire-and-forget,
+//	                                           never blocks or fails this response)
 //	GET  /api/daily/leaderboard?date=...    -> ranked standings
 //	POST /api/admin/sign-settlement        -> referee signs {roundId, winners[], amounts[]}
 //	POST /api/admin/pool/create            -> open a round on-chain + register it {entryFee, days}
@@ -21,8 +25,10 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
+	"sync"
 	"time"
 
 	"math/rand"
@@ -56,6 +62,15 @@ type Server struct {
 	writer   *chain.Writer  // may be nil if no operator key configured
 	rooms    *room.Manager
 	cfg      Config
+
+	// scoreLocks serializes recordScoreOnChain per (roundId, player): the on-chain `attempt`
+	// nonce must exactly match that player's current scoreCount, so two concurrent plays by
+	// the same player racing to read it would otherwise both sign the same attempt and the
+	// loser's write reverts InvalidAttempt and is silently dropped -- confirmed by driving two
+	// overlapping /api/daily/submit calls locally. The Writer's own mutex doesn't cover this:
+	// it only serializes the broadcast, not the scoreCount read that happens before it.
+	scoreLocksMu sync.Mutex
+	scoreLocks   map[string]*sync.Mutex
 }
 
 // New builds a Server. signer and chainCli may be nil (game works; signing/paid daily 503).
@@ -195,6 +210,7 @@ func (s *Server) handleDailySubmit(w http.ResponseWriter, r *http.Request) {
 	// Fund-safety gate: for a paid round, only score addresses that actually paid in, and
 	// only while entry is still open. Without this, an unpaid address could be scored,
 	// land on the leaderboard, and be signed as a winner — draining the honest pot.
+	var roundID *big.Int
 	if d.Paid {
 		if time.Now().UTC().After(d.EndTime) {
 			writeErr(w, http.StatusForbidden, "today's pool has closed")
@@ -204,7 +220,8 @@ func (s *Server) handleDailySubmit(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusServiceUnavailable, "pool verification unavailable")
 			return
 		}
-		roundID, ok := new(big.Int).SetString(d.RoundID, 10)
+		var ok bool
+		roundID, ok = new(big.Int).SetString(d.RoundID, 10)
 		if !ok {
 			writeErr(w, http.StatusInternalServerError, "bad round id")
 			return
@@ -229,6 +246,15 @@ func (s *Server) handleDailySubmit(w http.ResponseWriter, r *http.Request) {
 		At:      time.Now().UTC(),
 	})
 
+	// Every played game gets its own permanent on-chain record (not just the best), signed by
+	// the referee and logged the moment this play finishes -- independent of and well before
+	// settle(). Fire-and-forget: it runs in the background so a slow or failed chain write
+	// never blocks or fails the player's response; the off-chain leaderboard above is already
+	// the source of truth for gameplay, so a dropped on-chain write costs nothing but history.
+	if d.Paid && s.writer != nil && s.signer != nil {
+		go s.recordScoreOnChain(roundID, req.Address, result.Total)
+	}
+
 	rank := 0
 	for _, e := range d.Leaderboard() {
 		if common.HexToAddress(e.Address) == common.HexToAddress(req.Address) {
@@ -242,6 +268,59 @@ func (s *Server) handleDailySubmit(w http.ResponseWriter, r *http.Request) {
 		"rank":    rank,
 		"result":  result,
 	})
+}
+
+// recordScoreOnChain logs one played game's score on WordBreakPools, independent of and well
+// before settle(). Best-effort and asynchronous by design (see the call site in
+// handleDailySubmit): a slow RPC or a failed transaction here must never turn into a failed
+// response for the player, since the off-chain leaderboard is already durable and correct by
+// the time this runs. Serialized per (round, player) via scoreLock -- see its doc comment --
+// so the scoreCount read and the signed submission stay atomic for a given player even when
+// two of their plays are being recorded concurrently.
+func (s *Server) recordScoreOnChain(roundID *big.Int, address string, score int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	player := common.HexToAddress(address)
+
+	lock := s.scoreLock(roundID, player)
+	lock.Lock()
+	defer lock.Unlock()
+
+	attempt, err := s.chain.ScoreCount(ctx, roundID, player)
+	if err != nil {
+		log.Printf("recordScore: reading scoreCount for %s round %s: %v", address, roundID, err)
+		return
+	}
+	scoreBig := big.NewInt(int64(score))
+	sig, err := s.signer.SignScore(roundID, player, scoreBig, attempt)
+	if err != nil {
+		log.Printf("recordScore: signing for %s round %s: %v", address, roundID, err)
+		return
+	}
+	if err := s.writer.RecordScore(ctx, roundID, player, scoreBig, attempt, sig); err != nil {
+		log.Printf("recordScore: submitting for %s round %s: %v", address, roundID, err)
+	}
+}
+
+// scoreLock returns the mutex for a given (roundId, player), creating it on first use. Locks
+// are never removed -- one per distinct player-round pairing that has ever recorded a score --
+// which is a fine tradeoff at this scale; revisit only if that ever shows up as real memory
+// pressure.
+func (s *Server) scoreLock(roundID *big.Int, player common.Address) *sync.Mutex {
+	key := roundID.String() + ":" + player.Hex()
+
+	s.scoreLocksMu.Lock()
+	defer s.scoreLocksMu.Unlock()
+	if s.scoreLocks == nil {
+		s.scoreLocks = make(map[string]*sync.Mutex)
+	}
+	m, ok := s.scoreLocks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		s.scoreLocks[key] = m
+	}
+	return m
 }
 
 func (s *Server) handleLeaderboard(w http.ResponseWriter, r *http.Request) {

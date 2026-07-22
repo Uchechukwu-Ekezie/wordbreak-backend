@@ -89,6 +89,71 @@ func TestDigestMatchesContract(t *testing.T) {
 	}
 }
 
+// TestScoreDigestMatchesContract mirrors TestDigestMatchesContract for recordScore: the
+// expected value was emitted by the Solidity test `test_LogCanonicalScoreDigest` (same fixed
+// proxy address and chainId as the settlement cross-check, since it's the identical
+// deploy — CREATE2 with the same salt/bytecode/constructor args).
+func TestScoreDigestMatchesContract(t *testing.T) {
+	const (
+		poolAddr   = "0x6c9fbC0A14D27F72298215b81b21f6c35A7fb506"
+		chainID    = 42220
+		wantDigest = "0x160694af3338408d68e5050f1b5c6badba69a2cea968c0774e32c22595c628ad"
+	)
+	s, err := New(testPriv, chainID, poolAddr)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	roundID := big.NewInt(20260716)
+	player := common.HexToAddress("0x00000000000000000000000000000000000000A1")
+	score := big.NewInt(42)
+	attempt := big.NewInt(0)
+
+	digest, err := s.ScoreDigest(roundID, player, score, attempt)
+	if err != nil {
+		t.Fatalf("ScoreDigest: %v", err)
+	}
+	got := "0x" + common.Bytes2Hex(digest)
+	if got != wantDigest {
+		t.Fatalf("digest mismatch:\n go       = %s\n contract = %s", got, wantDigest)
+	}
+}
+
+func TestSignScore_RecoversToReferee(t *testing.T) {
+	s, err := New(testPriv, 42220, "0x1111111111111111111111111111111111111111")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	roundID := big.NewInt(20260716)
+	player := common.HexToAddress("0x00000000000000000000000000000000000000a1")
+	score := big.NewInt(17)
+	attempt := big.NewInt(3)
+
+	digest, err := s.ScoreDigest(roundID, player, score, attempt)
+	if err != nil {
+		t.Fatalf("ScoreDigest: %v", err)
+	}
+	sig, err := s.SignScore(roundID, player, score, attempt)
+	if err != nil {
+		t.Fatalf("SignScore: %v", err)
+	}
+	if len(sig) != 65 {
+		t.Fatalf("signature length = %d, want 65", len(sig))
+	}
+
+	recSig := make([]byte, 65)
+	copy(recSig, sig)
+	recSig[64] -= 27
+	pub, err := crypto.SigToPub(digest, recSig)
+	if err != nil {
+		t.Fatalf("SigToPub: %v", err)
+	}
+	if got := crypto.PubkeyToAddress(*pub); got != s.Address() {
+		t.Fatalf("recovered %s, want referee %s", got.Hex(), s.Address().Hex())
+	}
+}
+
 func TestSignSettlement_LengthMismatch(t *testing.T) {
 	s, _ := New(testPriv, 42220, "0x1111111111111111111111111111111111111111")
 	_, err := s.SignSettlement(big.NewInt(1),
